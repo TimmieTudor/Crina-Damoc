@@ -1,0 +1,14 @@
+audiocaps_data/
+audiocaps_data/*/
+coco_data/
+ARC/
+data/
+data/**/
+data/**/**
+multimodal_dataset_refined/
+multimodal_dataset_refined_v4/
+crina_checkpoints/
+crina_pretrain/
+__pycache__/
+tiny_shakespeare.txt
+trace_*.json
