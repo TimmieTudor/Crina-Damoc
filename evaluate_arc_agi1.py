@@ -7,9 +7,8 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 
-# Assume your CrinaSynapse model class is imported
-#from crina_model import CrinaSynapse  # Replace with your import
-from crina_tinyshakespeare import CrinaSynapse
+# Import the model components
+from crina_tinyshakespeare import CrinaSynapse, reset_all_lif_neurons
 
 def load_task(json_file):
     """Load a single ARC task from JSON."""
@@ -30,8 +29,6 @@ def sequence_to_grid(seq, h, w):
 
 def evaluate_task(model, task, device, num_attempts=3, temperature=0.1):
     """Evaluate on one task: Serialize demos + test input into a single sequence."""
-    from crina_tinyshakespeare import reset_all_lif_neurons
-    
     train_tasks = task['train']
     test_info = task['test'][0]
     test_input = test_info['input']
@@ -43,7 +40,7 @@ def evaluate_task(model, task, device, num_attempts=3, temperature=0.1):
     
     # Construct few-shot prompt
     full_prompt = []
-    for demo in train_tasks[:3]: 
+    for demo in train_tasks[:3]:  # Use up to 3 demos
         full_prompt += grid_to_sequence(demo['input'])
         full_prompt.append(SEP)
         full_prompt += grid_to_sequence(demo['output'])
@@ -64,8 +61,7 @@ def evaluate_task(model, task, device, num_attempts=3, temperature=0.1):
                 logits = model(current_seq)
                 next_token_logits = logits[:, -1, :]
                 
-                # Use greedy for first attempt, then temperature sampling
-                if temperature > 0 and attempt > 0:
+                if temperature > 0 and attempt > 0: # Add noise only after first failed attempt
                     probs = F.softmax(next_token_logits / temperature, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                 else:
@@ -74,8 +70,8 @@ def evaluate_task(model, task, device, num_attempts=3, temperature=0.1):
                 generated.append(next_token.item())
                 current_seq = torch.cat([current_seq, next_token], dim=1)
                 
-                if current_seq.size(1) > 1024:
-                    current_seq = current_seq[:, -1024:]
+                if current_seq.size(1) > 1025:
+                    current_seq = current_seq[:, -1025:]
                     
         pred_grid = sequence_to_grid(generated, target_h, target_w)
         if pred_grid == test_output:
@@ -94,6 +90,7 @@ def load_model_flexible(model_path, device):
         new_state_dict[name] = v
     state_dict = new_state_dict
 
+    # Detect vocab size from embedding weights
     checkpoint_vocab_size = state_dict['embed.weight'].shape[0]
     print(f"Detected checkpoint vocab_size: {checkpoint_vocab_size}")
     model = CrinaSynapse(vocab_size=checkpoint_vocab_size, d_model=256, n_layers=8, tree_depth=4)
@@ -103,16 +100,16 @@ def load_model_flexible(model_path, device):
     return model
 
 def main(args):
-    print(f"--- ARC-AGI-2 (Hard/Kaggle) Evaluation (Path: {args.data_dir}) ---")
+    print(f"--- ARC-AGI-1 Evaluation (Path: {args.data_dir}) ---")
     model = load_model_flexible(args.model_path, args.device)
     
     data_dir = Path(args.data_dir)
     tasks = list(data_dir.glob("*.json"))
     
     if not tasks:
-        print(f"No tasks found in {args.data_dir}. Point --data_dir to ARC-AGI-2 task folder.")
+        print(f"No tasks found in {args.data_dir}. Checking fallback...")
         return
-    
+
     total_success = 0
     pbar = tqdm(tasks)
     for file in pbar:
@@ -127,10 +124,10 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True, help="Path to Crina model checkpoint")
-    parser.add_argument("--data_dir", type=str, default="./ARC_AGI_2/data/evaluation", help="Dir with AGI-2 JSON files")
-    parser.add_argument("--device", type=str, default="cuda", help="Device")
-    parser.add_argument("--num_attempts", type=int, default=3, help="Attempts per task (Standard: 3)")
-    parser.add_argument("--temperature", type=float, default=0.1, help="Noise for sampling")
+    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--data_dir", type=str, default="./ARC/data/evaluation")
+    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--num_attempts", type=int, default=3)
+    parser.add_argument("--temperature", type=float, default=0.1)
     args = parser.parse_args()
     main(args)

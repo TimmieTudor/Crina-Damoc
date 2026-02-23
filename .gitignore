@@ -12,3 +12,11 @@ crina_pretrain/
 __pycache__/
 tiny_shakespeare.txt
 trace_*.json
+*.pth
+*.pt
+.env
+runs/
+cuda_lib/
+test_script_3.py
+wandb/
+torch_compile_debug/
