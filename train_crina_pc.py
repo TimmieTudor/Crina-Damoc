@@ -22,22 +22,30 @@ batch_size = 4
 
 # Predictive Coding Wrapper for TestCrina
 class PCCrina(nn.Module):
-    def __init__(self, model, lr_state=0.1, inference_steps=20):
+    def __init__(self, model, lr_state=0.01, inference_steps=10):
         super().__init__()
         self.model = model
         self.lr_state = lr_state
         self.inference_steps = inference_steps
         
-        # Each TestLayer needs a TOP-DOWN prediction module
-        # to predict the activations of the layer below.
         self.d_model = model.embed.embedding_dim
         self.num_layers = len(model.layers)
         
         # Predictive layers: Level l+1 predicts Level l
-        # Here we use simple linear projections for the top-down path.
         self.predictors = nn.ModuleList([
-            nn.Linear(self.d_model, self.d_model) for _ in range(self.num_layers)
+            nn.Sequential(
+                nn.Linear(self.d_model, self.d_model),
+                nn.LayerNorm(self.d_model)
+            ) for _ in range(self.num_layers)
         ])
+
+        # NEW: Layer-wise Inference Learning Rates
+        # Higher layers often need more/less aggressive updates to match sensory dynamics.
+        self.lr_state_layers = nn.Parameter(torch.ones(self.num_layers + 1) * lr_state, requires_grad=False)
+        
+        # NEW: Error Precision (Trainable)
+        # Scales the contribution of each layer's error to the total energy.
+        self.precisions = nn.Parameter(torch.ones(self.num_layers) * 1.0)
         
         # optimization: state persistence across chunks
         self.states_cache = None
@@ -65,27 +73,29 @@ class PCCrina(nn.Module):
         states = [p.clone().detach().requires_grad_(True) for p in self.states_cache]
         
         # 2. INFERENCE (E-Step): Minimize Energy
-        # We update 'states' to minimize the mismatch between neighbors in the hierarchy.
-        # Using Adam instead of SGD for better stability in complex energy landscapes.
-        optimizer_states = torch.optim.Adam(states, lr=self.lr_state)
+        # Using Adam for better stability. We pass per-layer LRs by creating different param groups.
+        param_groups = []
+        for l in range(self.num_layers + 1):
+            param_groups.append({'params': [states[l]], 'lr': self.lr_state_layers[l].item()})
+        
+        optimizer_states = torch.optim.Adam(param_groups)
         
         for _ in range(self.inference_steps):
             optimizer_states.zero_grad()
             energy = 0
             
-            # Prediction Errors (Hierarchical MSE)
+            # Prediction Errors with Precision Weighting
             for l in range(self.num_layers):
                 pred = self.predictors[l](states[l+1])
                 error = states[l] - pred
-                # Normalize by B, T, D to keep energy magnitude manageable
-                energy += torch.mean(error**2) 
+                # Scale by precision weight (softplus ensures positivity)
+                p = F.softplus(self.precisions[l])
+                energy += p * torch.mean(error**2) 
             
-            # Top-level error: Final layer must predict the target tokens
+            # Top-level error
             logits = self.model.lm_head(self.model.ln_f(states[-1]))
             target_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_tokens.view(-1))
             
-            # Total Energy = Hierarchical Error + Classification Error
-            # Balanced scaling
             total_energy = energy + target_loss
             
             total_energy.backward()
@@ -131,7 +141,11 @@ class PCCrina(nn.Module):
             v_h.append(layer(v_h[-1]))
             
         states = [p.clone().detach().requires_grad_(True) for p in v_h]
-        optimizer_states = torch.optim.Adam(states, lr=self.lr_state)
+        
+        param_groups = []
+        for l in range(self.num_layers + 1):
+            param_groups.append({'params': [states[l]], 'lr': self.lr_state_layers[l].item()})
+        optimizer_states = torch.optim.Adam(param_groups)
         
         with torch.enable_grad():
             for _ in range(self.inference_steps):
@@ -140,7 +154,8 @@ class PCCrina(nn.Module):
                 for l in range(self.num_layers):
                     pred = self.predictors[l](states[l+1])
                     error = states[l] - pred
-                    energy += torch.mean(error**2)
+                    p = F.softplus(self.precisions[l])
+                    energy += p * torch.mean(error**2)
                 
                 logits = self.model.lm_head(self.model.ln_f(states[-1]))
                 target_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_tokens.view(-1))
@@ -150,6 +165,26 @@ class PCCrina(nn.Module):
                 optimizer_states.step()
             
         return total_energy.item(), target_loss.item()
+
+    def initialize_from_model(self):
+        """
+        Initialize top-down predictors with Xavier initialization.
+        Feedback Alignment (weight transpose) is skipped as the current 
+        architecture uses a complex non-linear attention block.
+        """
+        with torch.no_grad():
+            for l in range(self.num_layers):
+                # Predictor is Sequential[Linear, LN]. Sequential[0] is Linear.
+                nn.init.xavier_uniform_(self.predictors[l][0].weight)
+                self.predictors[l][0].bias.data.zero_()
+
+    def set_layer_lrs(self, sensory_lr=0.02, abstract_lr=0.005):
+        """
+        Decay inference learning rates as we go higher in the hierarchy.
+        Sensory levels (0, 1) usually need faster updates.
+        """
+        lrs = torch.linspace(sensory_lr, abstract_lr, self.num_layers + 1)
+        self.lr_state_layers.data.copy_(lrs)
 
 def get_next_pair(idx):
     """
@@ -222,15 +257,20 @@ if __name__ == "__main__":
                     print("Dataset exhausted.")
                     return None, False
     
-    writer = SummaryWriter("runs/pc_crina_training/experiment_2")
+    writer = SummaryWriter("runs/pc_crina_training/experiment_deep_1")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Disable multiprocessing for downloads to avoid socket errors on Windows
     os.environ["HF_HUB_DISABLE_MP_DOWNLOAD"] = "1"
 
     # Initialize basic TestCrina
-    base_model = TestCrina(vocab_size=256, d_model=256, num_layers=8, tree_depth=4).to(device)
-    pc_model = PCCrina(base_model, lr_state=0.01, inference_steps=10).to(device)
+    # Scaling to 12 layers for "Deep" demonstration
+    base_model = TestCrina(vocab_size=256, d_model=256, num_layers=12, tree_depth=4).to(device)
+    pc_model = PCCrina(base_model, lr_state=0.01, inference_steps=15).to(device)
+    
+    # NEW: Apply deep-scaling optimizations
+    pc_model.initialize_from_model()
+    pc_model.set_layer_lrs(sensory_lr=0.02, abstract_lr=0.005)
 
     def save_model():
         if current_train_iter > 0:

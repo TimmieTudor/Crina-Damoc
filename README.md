@@ -41,3 +41,12 @@ Together, they aim to deliver private, efficient, multimodal AI directly on cons
 - `crina_tinyshakespeare.py` - The new implementation of the Crina model in Python, along with a script for training it on the Tiny Shakespeare dataset.
 - `crina_openwebtext.py` - An experimental script for training the Crina model on the OpenWebText dataset.
 - `test_attention.py` - The latest implementation of the Crina model in Python
+- `train_crina_pc.py` - A script to train the Crina model using Predictive Coding.
+
+## Warning
+
+This repository is a work in progress and is not ready for production use. Feel free to experiment with the code, open issues, and submit pull requests. Also check the discussions for more information.
+
+## License
+
+MIT License
