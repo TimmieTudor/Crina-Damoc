@@ -101,6 +101,9 @@ class FeedForwardSNN(nn.Module):
         x = self.linear2(x)
         return x
     
+    def reset_state(self):
+        self.lif.reset()
+    
     def init_weights(self):
         nn.init.xavier_uniform_(self.linear1.weight)
         nn.init.zeros_(self.linear1.bias)
@@ -184,6 +187,13 @@ class TestModel(nn.Module):
             
         return self.leaf_lif(self.leaf_norm(self.leaf_proj(torch.cat([x, contexts[0]], dim=-1))))
     
+    def reset_state(self):
+        for lif in self.up_lifs:
+            lif.reset()
+        for lif in self.down_lifs:
+            lif.reset()
+        self.leaf_lif.reset()
+    
     def init_weights(self):
         for proj in self.up_projs:
             nn.init.xavier_uniform_(proj.weight)
@@ -223,6 +233,10 @@ class TestLayer(nn.Module):
         x = x + self.residual_scale_ffn * self.post_norm_ffn(ffn_out)
         return x
     
+    def reset_state(self):
+        self.attention.reset_state()
+        self.feed_forward.reset_state()
+    
     def init_weights(self):
         self.pre_norm_attn.weight.data.fill_(1.0)
         self.post_norm_attn.weight.data.fill_(1.0)
@@ -246,14 +260,18 @@ class TestCrina(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.lm_head(self.ln_f(x))
+    
+    def reset_state(self):
+        for layer in self.layers:
+            layer.reset_state()
 
-    def compile(self):
+    def compile(self, fullgraph=False):
         """
         Optional: Compile layers for performance.
         Useful when seq_len is large and stable.
         """
         if hasattr(torch, "compile"):
-            self.layers = nn.ModuleList([torch.compile(l) for l in self.layers])
+            self.layers = nn.ModuleList([torch.compile(l, fullgraph=fullgraph) for l in self.layers])
             print("Model layers compiled.")
 
 if __name__ == "__main__":

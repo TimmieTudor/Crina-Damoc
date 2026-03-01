@@ -72,6 +72,7 @@ class PCCrina(nn.Module):
         
         # 1. INITIALIZATION
         if self.states_cache is None or is_new_doc or self.batch_size != B or use_lookahead:
+            self.model.reset_state()
             with torch.no_grad():
                 h = [self.model.embed(x_tokens)]
                 for layer in self.model.layers:
@@ -175,6 +176,7 @@ class PCCrina(nn.Module):
         Standard Backpropagation step for performance comparison.
         """
         self.zero_grad()
+        self.model.reset_state()
         logits = self.model(x_tokens)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_tokens.view(-1))
         loss.backward()
@@ -190,6 +192,8 @@ class PCCrina(nn.Module):
         """
         B, T = x_tokens.shape
         device = x_tokens.device
+
+        self.model.reset_state()
         
         v_h = [self.model.embed(x_tokens)]
         for layer in self.model.layers:
@@ -235,6 +239,7 @@ class PCCrina(nn.Module):
         Validation step using standard Backpropagation.
         """
         self.zero_grad()
+        self.model.reset_state()
         logits = self.model(x_tokens)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_tokens.view(-1))
         return loss.item()
@@ -365,12 +370,17 @@ if __name__ == "__main__":
     pc_model.set_layer_lrs(sensory_lr=0.02, abstract_lr=0.005)
 
     # Compile the specific training methods AFTER initialization
-    #if hasattr(torch, "compile") and mode == "pc":
-    #    print("Compiling PC training and validation steps...")
-    #    # We compile the methods directly because torch.compile(model) only targets model.forward()
-    #    pc_model.model = torch.compile(pc_model.model)
-    #    pc_model.pc_train_step = torch.compile(pc_model.pc_train_step)
-    #    pc_model.pc_val_step = torch.compile(pc_model.pc_val_step)
+    if hasattr(torch, "compile") and mode == "pc":
+        torch._dynamo.config.recompile_limit = 22
+        print("Compiling PC training and validation steps...")
+        # We compile the methods directly because torch.compile(model) only targets model.forward()
+        #pc_model.model.compile()
+        pc_model.pc_train_step = torch.compile(pc_model.pc_train_step)
+        pc_model.pc_val_step = torch.compile(pc_model.pc_val_step)
+        # Warmup
+        for _ in range(3):
+            pc_model.pc_train_step(torch.randint(0, 256, (batch_size, block_size)).to(device), torch.randint(0, 256, (batch_size, block_size)).to(device))
+            pc_model.pc_val_step(torch.randint(0, 256, (batch_size, block_size)).to(device), torch.randint(0, 256, (batch_size, block_size)).to(device))
 
     def save_model():
         if current_train_iter > 0:
@@ -411,6 +421,8 @@ if __name__ == "__main__":
             want_diagnostics = (current_train_iter % 10 == 0)
             loss, metrics = pc_model.pc_train_step(x_batch, y_batch, is_new_doc=is_new_doc_batch, return_metrics=want_diagnostics)
         else:
+            if is_new_doc_batch:
+                pc_model.model.reset_state()
             loss, grad_metrics = pc_model.bp_train_step(x_batch, y_batch)
         
         # Check for NaN/Inf Divergence
@@ -467,6 +479,8 @@ if __name__ == "__main__":
                         if mode == "pc":
                             v_energy, v_loss = pc_model.pc_val_step(vx, vy)
                         else:
+                            if is_new_doc_batch:
+                                pc_model.model.reset_state()
                             v_loss = pc_model.bp_val_step(vx, vy)
                             v_energy = 0
                         val_energy_acc += v_energy
