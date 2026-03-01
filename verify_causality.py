@@ -25,10 +25,8 @@ def verify_causality():
         for m in model.modules():
             if hasattr(m, 'reset'):
                 m.reset()
-
                 
         out2 = model(x2)
-
         
     # Check if all tokens except the last one are identical
     diff = (out1[:, :-1, :] - out2[:, :-1, :]).abs().max().item()
