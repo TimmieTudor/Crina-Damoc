@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 burn = { version = "0.19.0", features = ["wgpu", "train"] }
+burn-dataset = "0.19.0"
 serde = { version = "1.0", features = ["derive"] }
+hf-hub = "0.4.0"
+parquet = "53.0.0"
 
 # Optimization for numerical computing
 [profile.release]

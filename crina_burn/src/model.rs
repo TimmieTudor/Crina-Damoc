@@ -1,9 +1,17 @@
 use burn::{
     config::Config,
     module::{Module, Param},
-    nn::{Linear, LinearConfig, Embedding, EmbeddingConfig},
+    nn::{
+        loss::CrossEntropyLossConfig,
+        Embedding, EmbeddingConfig, Linear, LinearConfig,
+    },
     tensor::{backend::Backend, Tensor, Int},
+    train::{
+        metric::{AccuracyMetric, LossMetric},
+        TrainOutput, TrainStep, ValidStep, ClassificationOutput,
+    },
 };
+use crate::data::OpenWebTextBatch;
 
 // --- RMSNorm Implementation ---
 #[derive(Config, Debug)]
@@ -31,7 +39,8 @@ impl<B: Backend> RMSNorm<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         // rms = sqrt(mean(x^2) + eps)
         let rms = x.clone().powf_scalar(2.0).mean_dim(2).add_scalar(self.eps).sqrt();
-        
+        let rms = rms.clamp_min(1e-4);
+
         // x / rms * weight
         let x_norm = x.div(rms);
         let weight = self.weight.val().unsqueeze_dims(&[0, 1]);
@@ -91,7 +100,7 @@ impl<B: Backend> LIFNeuron<B> {
         
         // Simulated Fast Sigmoid (Normalized)
         let alpha = self.alpha;
-        let surr = diff.clone().abs().mul_scalar(alpha).add_scalar(1.0).powf_scalar(-2.0).mul_scalar(alpha);
+        let surr = diff.clone().abs().mul_scalar(alpha).add_scalar(1.0).powf_scalar(-2.0).mul_scalar(alpha).clamp(0.0, 1.0);
         
         // Straight-through: spike = (hard_spike - surr).detach() + surr
         let spike = hard_spike.clone().sub(surr.clone()).detach().add(surr);
@@ -105,6 +114,11 @@ impl<B: Backend> LIFNeuron<B> {
         // Like in Python: self.v = v_next[:, -1:, :].detach()
         let v_persistent = v_next.clone().slice([0..batch, (seq-1)..seq, 0..self.size]);
         
+        // Normalize spikes to prevent unbounded activations (matches Python reference)
+        // denom = spike.sum(dim=-1, keepdim=True).clamp(min=1.0)
+        let denom = spike.clone().sum_dim(2).clamp_min(1.0);
+        let spike = spike.div(denom);
+
         (spike, v_persistent)
     }
 }
@@ -329,6 +343,29 @@ impl<B: Backend> TestLayer<B> {
 
 // --- Main Model: TestCrina ---
 
+#[derive(Config, Debug)]
+pub struct TestCrinaConfig {
+    pub vocab_size: usize,
+    pub d_model: usize,
+    pub num_layers: usize,
+    pub tree_depth: usize,
+}
+
+impl TestCrinaConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> TestCrina<B> {
+        let layers = (0..self.num_layers)
+            .map(|_| TestLayer::new(self.d_model, self.tree_depth, device))
+            .collect();
+
+        TestCrina {
+            embed: EmbeddingConfig::new(self.vocab_size, self.d_model).init(device),
+            layers,
+            ln_f: RMSNorm::new(&RMSNormConfig::new(self.d_model), device),
+            lm_head: LinearConfig::new(self.d_model, self.vocab_size).init(device),
+        }
+    }
+}
+
 #[derive(Module, Debug)]
 pub struct TestCrina<B: Backend> {
     embed: Embedding<B>,
@@ -378,5 +415,39 @@ impl<B: Backend> TestCrina<B> {
         }).collect();
         
         CrinaState { layer_states }
+    }
+}
+
+// --- Training ---
+
+impl<B: Backend> TestCrina<B> {
+    pub fn forward_classification(&self, item: OpenWebTextBatch<B>) -> ClassificationOutput<B> {
+        let [batch, seq] = item.inputs.dims();
+        let state = self.init_state(batch, &item.inputs.device());
+        
+        let (logits, _) = self.forward(item.inputs.clone(), state); // [B, T, V]
+        
+        // Flatten for CrossEntropy: [B * T, V]
+        let logits_flat = logits.reshape([batch * seq, 256]);
+        let targets_flat = item.targets.clone().reshape([batch * seq]);
+        
+        let loss = CrossEntropyLossConfig::new()
+            .init(&item.targets.device())
+            .forward(logits_flat.clone(), targets_flat.clone());
+            
+        ClassificationOutput::new(loss, logits_flat, targets_flat)
+    }
+}
+
+impl<B: burn::tensor::backend::AutodiffBackend> TrainStep<OpenWebTextBatch<B>, ClassificationOutput<B>> for TestCrina<B> {
+    fn step(&self, item: OpenWebTextBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+        let output = self.forward_classification(item);
+        TrainOutput::new(self, output.loss.backward(), output)
+    }
+}
+
+impl<B: Backend> ValidStep<OpenWebTextBatch<B>, ClassificationOutput<B>> for TestCrina<B> {
+    fn step(&self, item: OpenWebTextBatch<B>) -> ClassificationOutput<B> {
+        self.forward_classification(item)
     }
 }
