@@ -30,13 +30,13 @@ os.environ["HF_HUB_DISABLE_MP_DOWNLOAD"] = "1"
 ds = load_dataset("vietgpt/openwebtext_en", split="train", streaming=True)
 
 block_size = 1024
-batch_size = 8
+batch_size = 4
 
 #model = CrinaSynapse(vocab_size=256, d_model=256, n_layers=8, tree_depth=4).to(device)
 model = TestCrina(vocab_size=256, d_model=256, num_layers=8, tree_depth=4).to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
 #scheduler = lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=500)
-scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=300_000, eta_min=5e-6)
+scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=300_000, eta_min=1e-7)
 
 #dummy_input = torch.randint(0, 256, (batch_size, block_size)).to(device)
 
@@ -49,15 +49,21 @@ scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=300_000, eta_min=5e-
 
 #exit()
 
-"""try:
+try:
     torch._dynamo.config.capture_dynamic_output_shape_ops = True
     torch._dynamo.config.capture_scalar_outputs = True
     #model = torch.compile(model, fullgraph=True)
     model = torch.compile(model)
     print("Model compiled successfully!")
+    # Warmup
+    compilation_start = time.time()
+    model(torch.randint(0, 256, (batch_size, block_size)).to(device))
+    model.reset_state()
+    compilation_end = time.time()
+    print(f"Model warmed up successfully! Compilation time: {compilation_end - compilation_start:.2f} seconds")
 except Exception as e:
     print("Failed to compile model. Skipping...")
-    print(e)"""
+    print(e)
 
 
 print(f"Model parameters: {sum([p.numel() for p in model.parameters()]):_}")
@@ -114,7 +120,7 @@ def get_next_pair(idx):
 
 accumulation_steps = 1
 optimizer.zero_grad()
-writer = SummaryWriter('runs/crina_stateful_batching_2')
+writer = SummaryWriter('runs/crina_stateful_batching_3')
 
 current_batch = 0
 current_train_iter = 0
@@ -136,8 +142,8 @@ try:
                 save_model()
                 exit()
             
-            #if needs_reset:
-            #    model.reset_state(i)
+            if needs_reset:
+                model.reset_state()
             
             batch_x.append(pair[0])
             batch_y.append(pair[1])

@@ -5,9 +5,8 @@ use burn::{
         loss::CrossEntropyLossConfig,
         Embedding, EmbeddingConfig, Linear, LinearConfig,
     },
-    tensor::{backend::Backend, Tensor, Int},
+    tensor::{backend::Backend, activation::sigmoid, Tensor, Int},
     train::{
-        metric::{AccuracyMetric, LossMetric},
         TrainOutput, TrainStep, ValidStep, ClassificationOutput,
     },
 };
@@ -38,7 +37,9 @@ impl<B: Backend> RMSNorm<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         // rms = sqrt(mean(x^2) + eps)
-        let rms = x.clone().powf_scalar(2.0).mean_dim(2).add_scalar(self.eps).sqrt();
+        // Optimization: use mul instead of powf_scalar for speed
+        let x_sq = x.clone().mul(x.clone());
+        let rms = x_sq.mean_dim(2).add_scalar(self.eps).sqrt();
         let rms = rms.clamp_min(1e-4);
 
         // x / rms * weight
@@ -55,6 +56,8 @@ pub struct LIFConfig {
     pub size: usize,
     #[config(default = 5.0)]
     pub alpha: f32,
+    #[config(default = 1.0)]
+    pub gain: f32,
 }
 
 #[derive(Module, Debug)]
@@ -64,6 +67,10 @@ pub struct LIFNeuron<B: Backend> {
     pub tau: Param<Tensor<B, 1>>,
     pub v_reset: Param<Tensor<B, 3>>,
     pub alpha: f32,
+    pub gain: f32,
+    pub surr_scale: f32, // alpha * gain
+    pub steps_const: Tensor<B, 3>,
+    pub persist_const: Tensor<B, 3>,
 }
 
 
@@ -73,53 +80,77 @@ impl<B: Backend> LIFNeuron<B> {
         let tau = Tensor::ones([config.size], device) * 0.5;
         let v_reset = Tensor::zeros([1, 1, config.size], device);
 
+        // Pre-compute constant tensors to reduce overhead
+        let steps_const = Tensor::<B, 1, Int>::arange(0..32, device).float().reshape([1, 32, 1]);
+        let persist_const = Tensor::<B, 1, Int>::arange(1..(512 + 1) as i64, device).float().reshape([1, 512, 1]);
+
         Self {
             size: config.size,
             threshold: Param::from_tensor(threshold),
             tau: Param::from_tensor(tau),
             v_reset: Param::from_tensor(v_reset),
             alpha: config.alpha,
+            gain: config.gain,
+            surr_scale: config.alpha * config.gain,
+            steps_const,
+            persist_const,
         }
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn forward(&self, x: Tensor<B, 3>, v_prev: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let [batch, seq, _] = x.dims();
-        
-        // Implementation of LIF Dynamics: v = tau * v_prev + x
-        let tau = self.tau.val().unsqueeze_dims(&[0, 1]);
-        let v_next_raw = v_prev.mul(tau).add(x);
-        
+        let [batch, seq, d_model] = x.dims();
         let threshold = self.threshold.val().unsqueeze_dims(&[0, 1]);
         
-        // Surrogate Gradient using Straight-Through Estimator trick
-        // spike = (v >= threshold)
-        // Backprop uses Fast Sigmoid: alpha / (1 + alpha * |v - threshold|)^2
+        // 1. Parallel Integration (SRM - Spike Response Model)
+        let k = 32;
+        let k_actual = if seq < k { seq } else { k };
         
-        let diff = v_next_raw.clone().sub(threshold.clone());
-        let hard_spike = v_next_raw.clone().greater_equal(threshold.clone()).float();
+        // steps_flip = (k_actual - 1) - steps
+        let steps_flip = self.steps_const.clone()
+            .slice([0..1, 0..k_actual, 0..1])
+            .mul_scalar(-1.0)
+            .add_scalar((k_actual - 1) as f32);
         
-        // Simulated Fast Sigmoid (Normalized)
-        let alpha = self.alpha;
-        let surr = diff.clone().abs().mul_scalar(alpha).add_scalar(1.0).powf_scalar(-2.0).mul_scalar(alpha).clamp(0.0, 1.0);
+        // Kernel: tau^steps. Shape: [D, 1, K]
+        // Optimization: avoid redundant unsqueezes
+        let tau_vec = self.tau.val().reshape([d_model, 1, 1]);
+        let log_tau = tau_vec.clone().clamp(0.001, 0.999).log();
+        let kernel = log_tau.mul(steps_flip.reshape([1, 1, k_actual])).exp();
         
-        // Straight-through: spike = (hard_spike - surr).detach() + surr
-        let spike = hard_spike.clone().sub(surr.clone()).detach().add(surr);
+        let x_trans = x.transpose();
+        let conv_options = burn::tensor::ops::ConvOptions::new([1], [k_actual - 1], [1], d_model);
+        let v_integrated_raw = burn::tensor::module::conv1d(x_trans, kernel, None, conv_options);
         
-        // Reset: v_next = v.masked_fill(mask, 0) + v_reset * spike
-        let mask = v_next_raw.clone().greater_equal(threshold).float();
-        let v_next = v_next_raw.mul(mask.clone().neg().add_scalar(1.0))
-            .add(spike.clone().mul(self.v_reset.val()));
-            
-        // Return (Spikes, v_persistent)
-        // Like in Python: self.v = v_next[:, -1:, :].detach()
-        let v_persistent = v_next.clone().slice([0..batch, (seq-1)..seq, 0..self.size]);
-        
-        // Normalize spikes to prevent unbounded activations (matches Python reference)
-        // denom = spike.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        let denom = spike.clone().sum_dim(2).clamp_min(1.0);
-        let spike = spike.div(denom);
+        let v_integrated = v_integrated_raw.slice([0..batch, 0..d_model, 0..seq]).transpose();
 
-        (spike, v_persistent)
+        // Add persistence (decayed) using pre-computed persist_const
+        let persist_steps = self.persist_const.clone().slice([0..1, 0..seq, 0..1]);
+        let tau_unsqueezed = self.tau.val().unsqueeze_dims(&[0, 1]).clamp(0.001, 0.999);
+        let persist_decay = tau_unsqueezed.log().mul(persist_steps).exp();
+        let v_persist = v_prev.mul(persist_decay);
+        let v_integrated = v_integrated.add(v_persist);
+
+        // 2. Vectorized Spiking & Soft Reset
+        let threshold_v = threshold.clone();
+        let diff = v_integrated.clone().sub(threshold_v.clone());
+        let hard_spike = v_integrated.clone().greater_equal(threshold_v.clone()).float();
+        
+        // Optimization: avoid powf_scalar(-2.0), use mul and recip
+        let surr_base = diff.clone().abs().mul_scalar(self.alpha).add_scalar(1.0);
+        let surr = surr_base.clone().mul(surr_base).recip().mul_scalar(self.surr_scale).clamp(0.0, 1.0);
+        let spike_seq = hard_spike.sub(surr.clone()).detach().add(surr);
+        
+        // Soft Reset approximation
+        let v_integrated = v_integrated.sub(spike_seq.clone().detach().mul(threshold_v).mul_scalar(0.5));
+        
+        // Normalize spikes
+        let output = spike_seq.clone().div(spike_seq.sum_dim(2).clamp_min(1.0));
+        
+        // Persistence
+        let v_final = v_integrated.slice([0..batch, (seq - 1)..seq, 0..d_model]);
+
+        (output, v_final)
     }
 }
 
@@ -135,6 +166,9 @@ pub struct TreeAttention<B: Backend> {
     down_projs: Vec<Linear<B>>,
     down_lifs: Vec<LIFNeuron<B>>,
     down_norms: Vec<RMSNorm<B>>,
+    up_selectors: Vec<Linear<B>>,
+    down_selectors: Vec<Linear<B>>,
+    leaf_selector: Linear<B>,
     leaf_proj: Linear<B>,
     leaf_lif: LIFNeuron<B>,
     leaf_norm: RMSNorm<B>,
@@ -156,15 +190,22 @@ impl<B: Backend> TreeAttention<B> {
         let mut down_lifs = Vec::new();
         let mut down_norms = Vec::new();
 
+        let mut up_selectors = Vec::new();
+        let mut down_selectors = Vec::new();
+
         for _ in 0..tree_depth {
             up_projs.push(LinearConfig::new(d_model * 2, d_model).init(device));
             up_lifs.push(LIFNeuron::new(&LIFConfig::new(d_model), device));
             up_norms.push(RMSNorm::new(&RMSNormConfig::new(d_model), device));
+            up_selectors.push(LinearConfig::new(d_model * 2, d_model).init(device));
             
             down_projs.push(LinearConfig::new(d_model * 2, d_model).init(device));
             down_lifs.push(LIFNeuron::new(&LIFConfig::new(d_model), device));
             down_norms.push(RMSNorm::new(&RMSNormConfig::new(d_model), device));
+            down_selectors.push(LinearConfig::new(d_model * 2, d_model).init(device));
         }
+
+        let leaf_selector = LinearConfig::new(d_model * 2, d_model).init(device);
 
         let leaf_proj = LinearConfig::new(d_model * 2, d_model).init(device);
         let leaf_lif = LIFNeuron::new(&LIFConfig::new(d_model), device);
@@ -179,12 +220,16 @@ impl<B: Backend> TreeAttention<B> {
             down_projs,
             down_lifs,
             down_norms,
+            up_selectors,
+            down_selectors,
+            leaf_selector,
             leaf_proj,
             leaf_lif,
             leaf_norm,
         }
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn forward(&self, x: Tensor<B, 3>, state: TreeState<B>) -> (Tensor<B, 3>, TreeState<B>) {
         let [batch, seq, d_model] = x.dims();
         let num_levels = (seq as f32).log2() as usize;
@@ -205,11 +250,15 @@ impl<B: Backend> TreeAttention<B> {
                 
             let proj_idx = if l < self.tree_depth { l } else { self.tree_depth - 1 };
             
+            let gate = sigmoid(self.up_selectors[proj_idx].forward(merged.clone()));
             let x_proj = self.up_projs[proj_idx].forward(merged);
-            let x_norm = self.up_norms[proj_idx].forward(x_proj);
+            let x_norm = self.up_norms[proj_idx].forward(x_proj.clone());
             let (spike, v_next) = self.up_lifs[proj_idx].forward(x_norm, state.up_v[proj_idx].clone());
+            let summary_with_skip = x_proj.add(spike); // Skip connection around LIF
             
-            summaries.push(spike.add(res));
+            // Selection: res + gate * (summary_with_skip - res)
+            let summary_next = res.clone().add(gate.mul(summary_with_skip.sub(res)));
+            summaries.push(summary_next);
             next_up_v[proj_idx] = v_next; // Accumulate in the shared state slot
         }
         
@@ -228,14 +277,18 @@ impl<B: Backend> TreeAttention<B> {
             
             let proj_idx = if (l-1) < self.tree_depth { l-1 } else { self.tree_depth - 1 };
             
+            let gate = sigmoid(self.down_selectors[proj_idx].forward(combined.clone()));
             let x_proj = self.down_projs[proj_idx].forward(combined);
-            let x_norm = self.down_norms[proj_idx].forward(x_proj);
-            let (ctx_right, v_next) = self.down_lifs[proj_idx].forward(x_norm, state.down_v[proj_idx].clone());
+            let x_norm = self.down_norms[proj_idx].forward(x_proj.clone());
+            let (ctx_right_raw, v_next) = self.down_lifs[proj_idx].forward(x_norm, state.down_v[proj_idx].clone());
+            let ctx_with_skip = x_proj.add(ctx_right_raw); // Skip connection around LIF
             
-            let ctx_right = ctx_right.add(parent_ctx.clone());
+            // Selection: parent_ctx + gate * (ctx_with_skip - parent_ctx)
+            let ctx_right = parent_ctx.clone().add(gate.mul(ctx_with_skip.sub(parent_ctx.clone())));
             
-            // Interleave
-            let ctx_interleaved = Tensor::cat(vec![parent_ctx.clone().unsqueeze_dim::<4>(2), ctx_right.unsqueeze_dim::<4>(2)], 2)
+            // Interleave: [P0, C0, P1, C1, ...]
+            // Optimization: use stack + reshape instead of unsqueeze + cat
+            let ctx_interleaved = Tensor::stack::<4>(vec![parent_ctx.clone(), ctx_right], 2)
                 .reshape([batch, parent_ctx.dims()[1] * 2, d_model]);
             contexts[l-1] = Some(ctx_interleaved);
             
@@ -243,10 +296,15 @@ impl<B: Backend> TreeAttention<B> {
         }
         
         // --- PHASE 3: LEAF MIXING ---
-        let combined_leaf = Tensor::cat(vec![x, contexts[0].clone().unwrap()], 2);
+        let combined_leaf = Tensor::cat(vec![x.clone(), contexts[0].clone().unwrap()], 2);
+        let gate = sigmoid(self.leaf_selector.forward(combined_leaf.clone()));
         let x_proj = self.leaf_proj.forward(combined_leaf);
-        let x_norm = self.leaf_norm.forward(x_proj);
-        let (output, next_leaf_v) = self.leaf_lif.forward(x_norm, state.leaf_v);
+        let x_norm = self.leaf_norm.forward(x_proj.clone());
+        let (leaf_output, next_leaf_v) = self.leaf_lif.forward(x_norm, state.leaf_v);
+        let leaf_with_skip = x_proj.add(leaf_output); // Skip connection around LIF
+        
+        // Final Selection: x + gate * (leaf_with_skip - x)
+        let output = x.clone().add(gate.mul(leaf_with_skip.sub(x)));
         
         let next_state = TreeState {
             up_v: next_up_v,
@@ -284,10 +342,12 @@ impl<B: Backend> FeedForwardSNN<B> {
         }
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn forward(&self, x: Tensor<B, 3>, v_prev: Tensor<B, 3>) -> (Tensor<B, 3>, Tensor<B, 3>) {
-        let x = self.linear1.forward(x);
-        let (spike, v_next) = self.lif.forward(x, v_prev);
-        let x = self.linear2.forward(spike);
+        let h = self.linear1.forward(x);
+        let (spike, v_next) = self.lif.forward(h.clone(), v_prev);
+        let h = h.add(spike); // Skip connection around LIF
+        let x = self.linear2.forward(h);
         (x, v_next)
     }
 }
@@ -321,11 +381,12 @@ impl<B: Backend> TestLayer<B> {
             pre_norm_ffn: RMSNorm::new(&RMSNormConfig::new(d_model), device),
             feed_forward: FeedForwardSNN::new(d_model, device),
             post_norm_ffn: RMSNorm::new(&RMSNormConfig::new(d_model), device),
-            residual_scale_attn: Param::from_tensor(Tensor::ones([1], device) * 0.01),
-            residual_scale_ffn: Param::from_tensor(Tensor::ones([1], device) * 0.01),
+            residual_scale_attn: Param::from_tensor(Tensor::ones([1], device) * 0.1),
+            residual_scale_ffn: Param::from_tensor(Tensor::ones([1], device) * 0.1),
         }
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn forward(&self, x: Tensor<B, 3>, state: LayerState<B>) -> (Tensor<B, 3>, LayerState<B>) {
         // Attention Branch
         let x_attn = self.pre_norm_attn.forward(x.clone());
@@ -394,6 +455,7 @@ impl<B: Backend> TestCrina<B> {
         }
     }
 
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn forward(&self, x: Tensor<B, 2, Int>, state: CrinaState<B>) -> (Tensor<B, 3>, CrinaState<B>) {
         let mut x = self.embed.forward(x);
         let mut next_layer_states = Vec::new();
@@ -421,6 +483,7 @@ impl<B: Backend> TestCrina<B> {
 // --- Training ---
 
 impl<B: Backend> TestCrina<B> {
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn forward_classification(&self, item: OpenWebTextBatch<B>) -> ClassificationOutput<B> {
         let [batch, seq] = item.inputs.dims();
         let state = self.init_state(batch, &item.inputs.device());

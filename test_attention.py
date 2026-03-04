@@ -51,38 +51,52 @@ class LIFNeuron(nn.Module):
         self.d_model = d_model
         self.alpha = alpha
         self.gain = gain
-        self.threshold = nn.Parameter(torch.ones(d_model) * 1.0)
+        self.threshold = nn.Parameter(torch.ones(d_model))
         self.tau = nn.Parameter(torch.ones(d_model) * 0.5)
         self.v_reset = nn.Parameter(torch.zeros(1, 1, d_model))
         self.register_buffer("v", torch.zeros(1, 1, d_model))
     
     def forward(self, x):
-        # Initial state update with broadcasting
-        # We MUST NOT modify v in-place after SurrogateSpike.apply
-        v = self.tau * self.v + x
+        B, T, D = x.shape
+        device = x.device
+        dtype = x.dtype
         
-        # Spike using Surrogate Gradient for backprop
-        # Reduced alpha for smoother gradients (5.0 is standard)
-        spike = SurrogateSpike.apply(v, self.threshold, self.alpha, self.gain)
+        # 1. Parallel Integration (SRM)
+        K = min(T, 64)
+        # Using exp(log) for faster power calculation and better stability
+        steps = torch.arange(K, device=device, dtype=dtype).flip(0).view(1, 1, K)
+        log_tau = torch.log(self.tau.clamp(0.001, 0.999)).view(D, 1, 1)
+        kappa = torch.exp(steps * log_tau)
         
-        # Reset mechanics - create a NEW version of v for the next state
-        # Removed no_grad to allow v_reset to receive gradients
-        mask = v >= self.threshold
-        # Out-of-place reset to avoid a 'modified by inplace operation' error
-        v_next = v.masked_fill(mask, 0.0) + self.v_reset * spike
+        # Causal convolution (groups=D for channel-wise)
+        x_padded = F.pad(x.transpose(1, 2), (K - 1, 0))
+        v_integrated = F.conv1d(x_padded, kappa, groups=D).transpose(1, 2)
         
-        # Persistence (save for next time step)
-        self.v = v_next[:, -1:, :].detach()
+        # Persistence (decayed)
+        p_steps = torch.arange(1, T + 1, device=device, dtype=dtype).view(1, -1, 1)
+        decay = torch.exp(p_steps * log_tau.view(1, 1, D))
+        v_integrated = v_integrated + (self.v * decay)
+
+        # 2. Spiking (Vectorized Surrogate) - Surr gradient inline for speed
+        diff = v_integrated - self.threshold
+        hard_spike = (v_integrated >= self.threshold).float()
+        surr = (self.alpha / (1 + self.alpha * diff.abs()).square()) * self.gain
+        spike_seq = (hard_spike - surr).detach() + surr
         
-        # Normalization (Safer epsilon + clamp to prevent gradient explosion)
-        # Gradient of 1/(x+eps) is -1/(x+eps)^2. If x=0, eps=1e-5, grad is -1e10!
-        # Clamping to 1.0 ensures we don't amplify gradients when there are 0 or 1 spikes.
-        denom = spike.sum(dim=-1, keepdim=True).clamp(min=1.0)
-        return spike / denom
-    
+        # Soft-Reset
+        v_integrated = v_integrated - (spike_seq.detach() * self.threshold * 0.5)
+
+        # Persistence for next batch
+        # CRITICAL: Must clone() to avoid CUDA Graph overwriting errors in reduce-overhead mode
+        self.v = v_integrated[:, -1:, :].detach().clone()
+        
+        # 3. Normalization (Per-token)
+        denom = spike_seq.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        return spike_seq / denom
+        
     def reset(self):
-        self.v = torch.zeros(1, 1, self.d_model).to(self.threshold.device)
-    
+        self.v.zero_()
+
     def init_weights(self):
         self.threshold.data.fill_(1.0)
         self.tau.data.fill_(0.5)
@@ -96,9 +110,9 @@ class FeedForwardSNN(nn.Module):
         self.lif = LIFNeuron(d_model * 4)
     
     def forward(self, x):
-        x = self.linear1(x)
-        x = self.lif(x)
-        x = self.linear2(x)
+        h = self.linear1(x)
+        h = h + self.lif(h)  # Skip connection around LIF
+        x = self.linear2(h)
         return x
     
     def reset_state(self):
@@ -131,6 +145,12 @@ class TestModel(nn.Module):
         # Experiment with down-sweep normalization
         self.down_norms = nn.ModuleList([nn.RMSNorm(d_model) for _ in range(tree_depth)])
 
+        # Selection Mechanism (Gating)
+        # We add "selectors" that allow the model to decide how much of the residual to keep
+        self.up_selectors = nn.ModuleList([nn.Linear(d_model * 2, d_model) for _ in range(tree_depth)])
+        self.down_selectors = nn.ModuleList([nn.Linear(d_model * 2, d_model) for _ in range(tree_depth)])
+        self.leaf_selector = nn.Linear(d_model * 2, d_model)
+
         # 3. Leaf mixing: output = Final(concat(x, C_leaf))
         self.leaf_proj = nn.Linear(d_model * 2, d_model)
         self.leaf_lif = LIFNeuron(d_model)
@@ -158,8 +178,10 @@ class TestModel(nn.Module):
             res = (merged[:, :, :D] + merged[:, :, D:]) * 0.5
             
             proj_idx = l if l < self.tree_depth else self.tree_depth - 1
-            summary_next = self.up_lifs[proj_idx](self.up_norms[proj_idx](self.up_projs[proj_idx](merged)))
-            summaries.append(summary_next + res)
+            gate = torch.sigmoid(self.up_selectors[proj_idx](merged))
+            x_proj = self.up_projs[proj_idx](merged)
+            summary_next = x_proj + self.up_lifs[proj_idx](self.up_norms[proj_idx](x_proj))  # Skip around LIF
+            summaries.append(gate * summary_next + (1 - gate) * res)
         
         # --- PHASE 2: DOWN-SWEEP (Distribution) ---
         # contexts[l] stores the left-prefix context for nodes at level l
@@ -174,18 +196,23 @@ class TestModel(nn.Module):
             # but view is usually cheap. The key is reducing torch.cat.
             child_summaries = summaries[l-1].view(B, parent_ctx.shape[1], 2, D)
             
-            # Left inherits, Right = Proj(Cat(Parent, LeftSummaries))
-            combined = torch.cat([parent_ctx, child_summaries[:, :, 0, :]], dim=-1)
             proj_idx = (l-1) if (l-1) < self.tree_depth else self.tree_depth - 1
-            ctx_right = self.down_lifs[proj_idx](self.down_norms[proj_idx](self.down_projs[proj_idx](combined)))
+            combined = torch.cat([parent_ctx, child_summaries[:, :, 0, :]], dim=-1)
+            gate = torch.sigmoid(self.down_selectors[proj_idx](combined))
+            x_proj = self.down_projs[proj_idx](combined)
+            ctx_right = x_proj + self.down_lifs[proj_idx](self.down_norms[proj_idx](x_proj))  # Skip around LIF
             
-            # Down-sweep Residual: Add parent context into the distributed right context
-            ctx_right = ctx_right + parent_ctx
+            # Down-sweep Selection residual
+            ctx_right = gate * ctx_right + (1 - gate) * parent_ctx
             
             # Interleave efficiently
             contexts[l-1] = torch.stack([parent_ctx, ctx_right], dim=2).view(B, -1, D)
             
-        return self.leaf_lif(self.leaf_norm(self.leaf_proj(torch.cat([x, contexts[0]], dim=-1))))
+        leaf_combined = torch.cat([x, contexts[0]], dim=-1)
+        gate = torch.sigmoid(self.leaf_selector(leaf_combined))
+        x_proj = self.leaf_proj(leaf_combined)
+        leaf_out = x_proj + self.leaf_lif(self.leaf_norm(x_proj))  # Skip around LIF
+        return gate * leaf_out + (1 - gate) * x
     
     def reset_state(self):
         for lif in self.up_lifs:
@@ -201,6 +228,15 @@ class TestModel(nn.Module):
         for proj in self.down_projs:
             nn.init.xavier_uniform_(proj.weight)
             nn.init.zeros_(proj.bias)
+        for sel in self.up_selectors:
+            nn.init.xavier_uniform_(sel.weight)
+            nn.init.constant_(sel.bias, -1.0) # Start biased towards residual
+        for sel in self.down_selectors:
+            nn.init.xavier_uniform_(sel.weight)
+            nn.init.constant_(sel.bias, -1.0)
+        nn.init.xavier_uniform_(self.leaf_selector.weight)
+        nn.init.constant_(self.leaf_selector.bias, -1.0)
+
         nn.init.xavier_uniform_(self.leaf_proj.weight)
         nn.init.zeros_(self.leaf_proj.bias)
         for lif in self.up_lifs:
@@ -220,8 +256,8 @@ class TestLayer(nn.Module):
         self.feed_forward = FeedForwardSNN(d_model)
         self.post_norm_ffn = nn.RMSNorm(d_model)
 
-        self.residual_scale_attn = nn.Parameter(torch.tensor(0.01))
-        self.residual_scale_ffn = nn.Parameter(torch.tensor(0.01))
+        self.residual_scale_attn = nn.Parameter(torch.tensor(0.1))
+        self.residual_scale_ffn = nn.Parameter(torch.tensor(0.1))
     
     def forward(self, x):
         # Apply RMSNorm and Attention Residual
@@ -244,8 +280,8 @@ class TestLayer(nn.Module):
         self.post_norm_ffn.weight.data.fill_(1.0)
         self.attention.init_weights()
         self.feed_forward.init_weights()
-        self.residual_scale_attn.data.fill_(0.01)
-        self.residual_scale_ffn.data.fill_(0.01)
+        self.residual_scale_attn.data.fill_(0.1)
+        self.residual_scale_ffn.data.fill_(0.1)
 
 class TestCrina(nn.Module):
     def __init__(self, vocab_size, d_model, num_layers, tree_depth):
@@ -267,18 +303,17 @@ class TestCrina(nn.Module):
 
     def compile(self, fullgraph=False):
         """
-        Optional: Compile layers for performance.
-        Useful when seq_len is large and stable.
+        Compile the whole model for peak performance.
         """
         if hasattr(torch, "compile"):
-            self.layers = nn.ModuleList([torch.compile(l, fullgraph=fullgraph) for l in self.layers])
-            print("Model layers compiled.")
+            # Compile the entire model to fuse the hierarchical tree loops
+            print("Compiling model (Full)...")
+            return torch.compile(self, fullgraph=fullgraph)
+        return self
 
 if __name__ == "__main__":
     # Optimize for Tensor Cores
     torch.set_float32_matmul_precision('high')
-    # Enable anomaly detection to find the exact source of NaNs
-    torch.autograd.set_detect_anomaly(True)
     
     B, T, D = 4, 1024, 256
     model = TestCrina(256, 256, 12, 4).to(device)
@@ -286,61 +321,32 @@ if __name__ == "__main__":
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
     
-    # Gradient Check (Verification)
-    print("Verifying Gradient Flow for LIF Parameters...")
-    model.train()
-    x_grad = torch.randint(0, 256, (B, T)).to(device)
-    y_grad = model(x_grad)
-    
-    # Check for NaNs early in forward pass
-    if torch.isnan(y_grad).any():
-        print("Warning: Forward pass already contains NaNs!")
-    
-    loss = y_grad.mean()
-    loss.backward()
-    
-    # Check specific LIF parameters in the first attention layer
-    first_attn = model.layers[0].attention
-    params_to_check = {
-        "Weight Proj (Tree Leaf)": first_attn.up_projs[0].weight,
-        "Weight Proj (Tree Root)": first_attn.up_projs[-1].weight,
-        "LIF Tau": first_attn.up_lifs[0].tau,
-        "LIF Threshold": first_attn.up_lifs[0].threshold,
-        "LIF V_Reset": first_attn.up_lifs[0].v_reset
-    }
-    
-    for name, param in params_to_check.items():
-        has_grad = param.grad is not None
-        grad_norm = param.grad.norm().item() if has_grad else 0.0
-        print(f"{name} -> Has Grad: {has_grad}, Grad Norm: {grad_norm:.6f}")
-    
-    # Check for NaNs in all gradients
-    if torch.isnan(torch.tensor([p.grad.norm().item() for p in model.parameters() if p.grad is not None])).any():
-        print("NaN detected in gradients!")
-    
-    # Baseline benchmark (Improved CPU/GPU code)
+    # Baseline benchmark
     print("Running Uncompiled Baseline...")
     model.eval()
     with torch.no_grad():
-        for _ in range(2):
+        for _ in range(5):
             y = model(x)
         
         start = time.time()
-        for _ in range(10):
+        for _ in range(20):
             y = model(x)
         end = time.time()
-        print(f"Uncompiled average inference time: {(end-start)/10:.4f}s")
+        print(f"Uncompiled average inference time: {(end-start)/20:.4f}s")
 
     # Compiled benchmark
-    model.compile()
+    compiled_model = model.compile()
     with torch.no_grad():
-        print("Compiling (First pass will be slow)...")
-        y = model(x) # Cold start
+        print("Compiling (Warmup will be slow)...")
+        # Compiler needs multiple steps to optimize
+        for i in range(15):
+            y = compiled_model(x)
+            if i % 5 == 0: print(f"Warmup {i}/15...")
         
         start = time.time()
-        for _ in range(10):
-            y = model(x)
+        for _ in range(20):
+            y = compiled_model(x)
         end = time.time()
     
     print(f"Output shape: {y.shape}")
-    print(f"Compiled average inference time: {(end-start)/10:.4f}s")
+    print(f"Compiled average inference time: {(end-start)/20:.4f}s")

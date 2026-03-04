@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import sys
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 from test_attention import TestCrina, TestLayer, FeedForwardSNN
 import matplotlib.pyplot as plt
 import time
@@ -16,10 +16,23 @@ from dotenv import load_dotenv
 import atexit
 load_dotenv()
 
+# initial_lr_state = 0.02
+# final_lr_state = 0.01
+
 block_size = 1024
 batch_size = 4
-#initial_lr_state = 0.02
-#final_lr_state = 0.01
+
+# FIX: Windows Inductor C++ Compilation Bug (zuf undeclared identifier)
+import torch._inductor.config as inductor_config
+if sys.platform == "win32":
+    # Disable C++ wrapper to avoid 'zuf' undeclared identifier bugs in generated code
+    inductor_config.cpp_wrapper = False
+    inductor_config.disable_cpp_codegen = True
+    #inductor_config.cpp.enable_kernel_profile = False
+    # Disable C++ JIT compilation entirely
+    #inductor_config.cpp.jit_compile = False
+    # Disable vector ISA check to avoid searching for 'cl.exe' or hitting ISA-related bugs
+    inductor_config.cpp.vec_isa_ok = False
 
 # Predictive Coding Wrapper for TestCrina
 class PCCrina(nn.Module):
@@ -370,17 +383,31 @@ if __name__ == "__main__":
     pc_model.set_layer_lrs(sensory_lr=0.02, abstract_lr=0.005)
 
     # Compile the specific training methods AFTER initialization
-    if hasattr(torch, "compile") and mode == "pc":
+    # Optional: Compile the specific training methods for final production runs.
+    # We disable this by default now because P-LIF is fast enough in eager mode (<0.1s),
+    # and compilation wait times are currently a bottleneck for iteration.
+    if hasattr(torch, "compile"):
         torch._dynamo.config.recompile_limit = 22
-        print("Compiling PC training and validation steps...")
-        # We compile the methods directly because torch.compile(model) only targets model.forward()
-        #pc_model.model.compile()
-        pc_model.pc_train_step = torch.compile(pc_model.pc_train_step)
-        pc_model.pc_val_step = torch.compile(pc_model.pc_val_step)
-        # Warmup
-        for _ in range(3):
-            pc_model.pc_train_step(torch.randint(0, 256, (batch_size, block_size)).to(device), torch.randint(0, 256, (batch_size, block_size)).to(device))
-            pc_model.pc_val_step(torch.randint(0, 256, (batch_size, block_size)).to(device), torch.randint(0, 256, (batch_size, block_size)).to(device))
+        torch._dynamo.config.capture_scalar_outputs = True
+        print(f"Compiling {mode.upper()} training and validation steps...")
+        x_batch = torch.randint(0, 256, (batch_size, block_size)).to(device)
+        y_batch = torch.randint(0, 256, (batch_size, block_size)).to(device)
+        is_new_doc_batch = True
+
+        if mode == "pc":
+            pc_model.pc_train_step = torch.compile(pc_model.pc_train_step)
+            pc_model.pc_val_step = torch.compile(pc_model.pc_val_step)
+            # Warmup
+            for _ in range(5):
+                pc_model.pc_train_step(x_batch, y_batch, is_new_doc_batch)
+                pc_model.pc_val_step(x_batch, y_batch, is_new_doc_batch)
+        else:
+            pc_model.bp_train_step = torch.compile(pc_model.bp_train_step)
+            pc_model.bp_val_step = torch.compile(pc_model.bp_val_step)
+            # Warmup
+            for _ in range(5):
+                pc_model.bp_train_step(x_batch, y_batch)
+                pc_model.bp_val_step(x_batch, y_batch)
 
     def save_model():
         if current_train_iter > 0:
@@ -391,8 +418,8 @@ if __name__ == "__main__":
     atexit.register(save_model)
 
     optimizer_weights = torch.optim.AdamW(pc_model.parameters(), lr=1e-4, weight_decay=0.01)
-    scheduler = ReduceLROnPlateau(optimizer_weights, mode='min', factor=0.75, patience=5)
-    
+    #scheduler = ReduceLROnPlateau(optimizer_weights, mode='min', factor=0.75, patience=5)
+    scheduler = CosineAnnealingLR(optimizer_weights, T_max=10_000, eta_min=1e-7)
     print("Starting Predictive Coding Training on TestCrina...")
     losses = []
     while current_train_iter < 10000:
@@ -435,6 +462,7 @@ if __name__ == "__main__":
         grad_norm = torch.nn.utils.clip_grad_norm_(pc_model.parameters(), max_norm=1.0)
         
         optimizer_weights.step()
+        scheduler.step()
         optimizer_weights.zero_grad()
 
         losses.append(loss)
@@ -493,7 +521,7 @@ if __name__ == "__main__":
             writer.add_scalar("Val/Cross Entropy", avg_val_loss, current_train_iter)
             
             # Step the scheduler based on validation loss
-            scheduler.step(avg_val_loss)
+            #scheduler.step(avg_val_loss)
             writer.add_scalar("Train/Learning Rate", optimizer_weights.param_groups[0]['lr'], current_train_iter)
             writer.add_scalar("Train/State Learning Rate", pc_model.lr_state, current_train_iter)
             

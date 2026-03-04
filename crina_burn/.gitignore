@@ -1,3 +1,4 @@
 target/
 crina-checkpoints/
 Cargo.lock
+trace-*.json

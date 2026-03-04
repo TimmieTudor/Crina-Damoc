@@ -2,12 +2,18 @@
 mod model;
 mod data;
 
-use burn::backend::{Wgpu, wgpu::{WgpuDevice, WgpuRuntime}};
+#[cfg(feature = "wgpu")]
+use burn::backend::{Wgpu, wgpu::{WgpuDevice}};
+#[cfg(feature = "cuda")]
+use burn::backend::{Cuda, cuda::CudaDevice};
+
 use burn::backend::Autodiff;
 use burn::optim::AdamWConfig;
 use burn::grad_clipping::GradientClippingConfig;
-use burn::train::metric::{LossMetric, AccuracyMetric};
 use burn::train::LearnerBuilder;
+use burn::train::metric::{LossMetric, AccuracyMetric};
+use tracing_subscriber::prelude::*;
+use tracing_subscriber::EnvFilter;
 use burn::config::Config;
 use burn::data::dataloader::DataLoaderBuilder;
 use burn::record::CompactRecorder;
@@ -19,9 +25,9 @@ pub struct TrainingConfig {
     pub optimizer: AdamWConfig,
     #[config(default = 10)]
     pub num_epochs: usize,
-    #[config(default = 4)]
+    #[config(default = 8)]
     pub batch_size: usize,
-    #[config(default = 4)]
+    #[config(default = 0)]
     pub num_workers: usize,
     #[config(default = 42)]
     pub seed: u64,
@@ -68,17 +74,43 @@ fn train<B: burn::tensor::backend::AutodiffBackend>(artifact_dir: &str, config: 
     let _model_trained = learner.fit(dataloader_train, dataloader_test);
 }
 
-fn main() {
-    type MyBackend = Wgpu<f32, i32, u32>;
-    type MyAutodiffBackend = Autodiff<MyBackend>;
-
-    let device = WgpuDevice::default();
-    let artifact_dir = "crina-checkpoints";
-
+fn run<B: burn::tensor::backend::AutodiffBackend>(device: B::Device, artifact_dir: &str) {
     let config = TrainingConfig::new(
         model::TestCrinaConfig::new(256, 256, 12, 4), // vocab, d_model, layers, depth
         AdamWConfig::new().with_grad_clipping(Some(GradientClippingConfig::Norm(1.0))),
     );
 
-    train::<MyAutodiffBackend>(artifact_dir, config, device);
+    train::<B>(
+        artifact_dir,
+        config,
+        device,
+    );
+}
+
+fn main() {
+    let (chrome_layer, _guard) = tracing_chrome::ChromeLayerBuilder::new().build();
+    let filter = EnvFilter::from_default_env()
+        .add_directive("crina_burn=trace".parse().unwrap());
+    tracing_subscriber::registry().with(filter).with(chrome_layer).init();
+    println!("Tracing enabled. A trace-*.json file will be saved in the current directory.");
+
+    let artifact_dir = "crina-checkpoints";
+
+    #[cfg(feature = "cuda")]
+    {
+        println!("CUDA is available, using Cuda backend");
+        run::<Autodiff<Cuda>>(CudaDevice::default(), artifact_dir);
+        return;
+    }
+
+    #[cfg(feature = "wgpu")]
+    {
+        println!("Using Wgpu backend (default fallback)");
+        run::<Autodiff<Wgpu>>(WgpuDevice::default(), artifact_dir);
+    }
+
+    #[cfg(not(any(feature = "cuda", feature = "wgpu")))]
+    {
+        compile_error!("Please enable at least one of the following features: cuda, wgpu");
+    }
 }

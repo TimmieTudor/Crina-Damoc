@@ -4,11 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-burn = { version = "0.19.0", features = ["wgpu", "train"] }
+burn = { version = "0.19.0", features = ["train"] }
 burn-dataset = "0.19.0"
 serde = { version = "1.0", features = ["derive"] }
 hf-hub = "0.4.0"
 parquet = "53.0.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-chrome = "0.7.1"
+
+
+[features]
+default = ["wgpu"]
+cuda = ["burn/cuda"]
+wgpu = ["burn/wgpu"]
 
 # Optimization for numerical computing
 [profile.release]

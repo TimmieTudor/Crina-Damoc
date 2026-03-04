@@ -86,39 +86,40 @@ impl<B: Backend> OpenWebTextBatcher<B> {
 }
 
 impl<B: Backend> Batcher<B, OpenWebTextItem, OpenWebTextBatch<B>> for OpenWebTextBatcher<B> {
+    #[tracing::instrument(level = "info", skip_all)]
     fn batch(&self, items: Vec<OpenWebTextItem>, device: &B::Device) -> OpenWebTextBatch<B> {
         let batch_size = items.len();
-        let mut inputs_list = Vec::with_capacity(batch_size);
-        let mut targets_list = Vec::with_capacity(batch_size);
+        
+        // Flattened buffers for the whole batch
+        let mut inputs_flat = vec![0i32; batch_size * self.max_seq_len];
+        let mut targets_flat = vec![0i32; batch_size * self.max_seq_len];
 
-        for item in items {
+        for (b, item) in items.into_iter().enumerate() {
             let bytes = item.text.as_bytes();
             // Take up to max_seq_len + 1 to yield max_seq_len inputs and 1-shifted targets
             let len = bytes.len().min(self.max_seq_len + 1);
             let truncated = &bytes[..len];
 
-            let mut input_data = vec![0i32; self.max_seq_len];
-            let mut target_data = vec![0i32; self.max_seq_len];
-
             // If we have at least 2 tokens, we can form a pair
             if len >= 2 {
                 let actual_len = len - 1;
                 for i in 0..actual_len {
-                    input_data[i] = truncated[i] as i32;
-                    target_data[i] = truncated[i + 1] as i32;
+                    inputs_flat[b * self.max_seq_len + i] = truncated[i] as i32;
+                    targets_flat[b * self.max_seq_len + i] = truncated[i + 1] as i32;
                 }
             }
-
-            // Create tensors from raw data
-            let input_tensor = Tensor::<B, 1, Int>::from_data(TensorData::from(&input_data[..]), &device).unsqueeze::<2>();
-            let target_tensor = Tensor::<B, 1, Int>::from_data(TensorData::from(&target_data[..]), &device).unsqueeze::<2>();
-
-            inputs_list.push(input_tensor);
-            targets_list.push(target_tensor);
         }
 
-        let inputs = Tensor::cat(inputs_list, 0);
-        let targets = Tensor::cat(targets_list, 0);
+        // Create 2D tensors directly from the flat buffers
+        // Shape: [batch_size, max_seq_len]
+        let inputs = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(inputs_flat, [batch_size, self.max_seq_len]),
+            device,
+        );
+        let targets = Tensor::<B, 2, Int>::from_data(
+            TensorData::new(targets_flat, [batch_size, self.max_seq_len]),
+            device,
+        );
 
         OpenWebTextBatch { inputs, targets }
     }
